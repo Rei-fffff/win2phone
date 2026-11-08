@@ -1,0 +1,37 @@
+# ---------- Python (PC host / panel) ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.wheels/
+
+# ---------- Android / Gradle ----------
+.gradle/
+build/
+app/build/
+local.properties
+*.apk
+*.aab
+*.jks
+*.keystore
+captures/
+.cxx/
+
+# ---------- IDE ----------
+.idea/
+*.iml
+.vscode/
+*.swp
+
+# ---------- OS ----------
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ---------- 运行时产物 ----------
+*.log
+logs/
+recordings/
+*.mp4
+*.h264
