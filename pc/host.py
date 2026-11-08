@@ -597,6 +597,37 @@ def control_server(cfg: Config, stop: threading.Event, hub: ControlHub) -> None:
 
 
 # ------------------------------------------------------------------------ main
+_CTRL_HANDLER = None      # keep the callback alive; Windows holds a raw pointer
+
+
+def _install_close_handler(on_close) -> bool:
+    """Run ``on_close`` when the console window is closed.
+
+    Closing a console window does not raise KeyboardInterrupt — Windows sends
+    CTRL_CLOSE_EVENT and then kills the process, so a plain ``finally`` never
+    runs and the virtual display would be left behind. Handling the event gives
+    us a few seconds to detach it.
+    """
+    global _CTRL_HANDLER
+    try:
+        prototype = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
+        CTRL_CLOSE_EVENT = 2
+
+        def _handler(ctrl_type: int) -> int:
+            if ctrl_type == CTRL_CLOSE_EVENT:
+                try:
+                    on_close()
+                except Exception:
+                    pass
+                return 1
+            return 0        # let Ctrl+C stay a normal KeyboardInterrupt
+
+        _CTRL_HANDLER = prototype(_handler)
+        return bool(ctypes.windll.kernel32.SetConsoleCtrlHandler(_CTRL_HANDLER, True))
+    except Exception:
+        return False
+
+
 def main() -> int:
     cfg = parse_args()
     if cfg.list_only:
@@ -642,6 +673,20 @@ def main() -> int:
     print(f"[init] 手机端 USB 连接前先执行：\n"
           f"        adb reverse tcp:{cfg.video_port} tcp:{cfg.video_port}\n"
           f"        adb reverse tcp:{cfg.control_port} tcp:{cfg.control_port}")
+
+    detached = threading.Event()
+
+    def detach_once() -> None:
+        if vd is None or detached.is_set():
+            return
+        detached.set()
+        try:
+            disp.detach()
+            print("[vdd] 虚拟屏已摘除")
+        except Exception as exc:
+            print(f"[vdd] 摘除失败：{exc}")
+
+    _install_close_handler(detach_once)
     try:
         while True:
             time.sleep(1)
@@ -649,12 +694,7 @@ def main() -> int:
         print("\n[main] 停止中…")
         stop.set()
     finally:
-        if vd is not None:
-            try:
-                disp.detach()
-                print("[vdd] 虚拟屏已摘除")
-            except Exception as exc:
-                print(f"[vdd] 摘除失败：{exc}")
+        detach_once()
     return 0
 
 
