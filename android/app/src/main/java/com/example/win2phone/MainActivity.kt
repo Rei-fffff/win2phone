@@ -305,6 +305,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
+    /** Rotate to match the virtual display's shape (portrait 1080x2400 / landscape 2400x1080). */
+    private fun applyOrientation(value: String) {
+        val wanted = when (value) {
+            "portrait" -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            "landscape" -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            else -> return
+        }
+        runOnUiThread {
+            if (requestedOrientation != wanted) requestedOrientation = wanted
+        }
+    }
+
     private fun startConnection(host: String) {
         val h = host.trim()
         if (h.isEmpty()) { toast("请填写 PC 地址"); return }
@@ -381,18 +393,17 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                         width = w
                         height = h
                     }
+                    // The virtual display's shape decides how the Activity must
+                    // be rotated; otherwise the video gets stretched to the
+                    // wrong aspect ratio.
+                    applyOrientation(o.optString("orientation"))
                     Log.i(TAG, "control $kind ${w}x${h} "
                             + "side=${o.optString("side")} "
                             + "orientation=${o.optString("orientation")}")
                 }
                 "orientation" -> {
+                    applyOrientation(o.optString("value"))
                     val portrait = o.optString("value") == "portrait"
-                    runOnUiThread {
-                        requestedOrientation = if (portrait)
-                            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-                        else
-                            ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-                    }
                     toast("PC 已切换为" + if (portrait) "竖屏" else "横屏")
                     Log.i(TAG, "PC requested ${if (portrait) "portrait" else "landscape"}")
                 }

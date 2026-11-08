@@ -60,14 +60,21 @@ UTF-8，**一行一个 JSON 对象**（`\n` 分隔）。
 
 | 字段 | 说明 |
 |---|---|
-| `side` | `right`/`left`/`top`/`bottom`，决定鼠标从哪条边穿到手机 |
-| `orientation` | `landscape`/`portrait` |
-| `width`, `height` | `--scale` 之后的**编码**尺寸；手机端仅作 SPS 之外的兜底 |
-| `source_width`, `source_height` | 采集源分辨率 |
-| `scale` | 当前缩放设置，`none` 表示未缩放 |
-| `fps`, `codec` | 帧率与实际编码器（`nvenc`/`x264`） |
-| `display_applied` | Windows 显示器设置是否真的生效；`false` 通常是没装 VDD |
+| `side` | `right`/`left`/`top`/`bottom`，虚拟屏相对主屏的位置，决定鼠标从哪条边穿过去 |
+| `orientation` | `landscape`/`portrait`；手机端据此旋转 Activity，必须与虚拟屏形状一致 |
+| `width`, `height` | 虚拟屏（= 编码）分辨率，M1 起等于手机原生比例 |
+| `source_width`, `source_height` | 采集源分辨率，与上面相同（不再缩放） |
+| `left`, `top` | 虚拟屏在 Windows 虚拟桌面里的原点；触控映射用这个 |
+| `fps`, `bitrate`, `codec` | 帧率、目标码率、实际编码器（`nvenc`/`x264`） |
+| `display_applied` | Windows 显示器设置是否真的生效；`false` 一般是 VDD 未安装或未接入桌面 |
 | `note` | 人类可读提示 |
+
+> **一条命令只回一条消息。** 早期版本在 `hello` 时额外推一条 `orientation`，
+> 导致面板的「请求-应答」配对错位（读到上一条的回复）。方向由 App 从
+> `hello`/`status` 里读 `orientation` 字段自行旋转。
+>
+> `orientation` 会触发主机切换虚拟屏分辨率并重启视频会话；手机端应在 ~700 ms 后
+> 自动重连，新码流的 SPS 尺寸会随之变化（1080×2400 ↔ 2400×1080）。
 
 > 广播时发送者被排除，只收一次直接回复，避免同一条消息重复到达。
 > `orientation` 会触发主机断开当前视频会话；手机端应在 ~700 ms 后自动重连，

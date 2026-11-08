@@ -1,0 +1,56 @@
+<?xml version='1.0' encoding='utf-8'?>
+<!--
+  Win2Phone 专用 VDD 配置
+  分辨率全部按手机屏幕原生 9:20 比例（1080x2400）给出，手机端 1:1 铺满，
+  不变形、不 letterbox，触控坐标天然准确。
+  改完这个文件后需要重启虚拟显示器（禁用/启用设备）才会重新读取。
+-->
+<vdd_settings>
+    <monitors>
+        <count>1</count>
+    </monitors>
+    <gpu>
+        <friendlyname>default</friendlyname>
+    </gpu>
+    <global>
+        <g_refresh_rate>60</g_refresh_rate>
+    </global>
+    <resolutions>
+        <!-- 竖屏：手机原生 -->
+        <resolution>
+            <width>1080</width>
+            <height>2400</height>
+            <refresh_rate>60</refresh_rate>
+        </resolution>
+        <!-- 横屏：手机旋转 90 度 -->
+        <resolution>
+            <width>2400</width>
+            <height>1080</height>
+            <refresh_rate>60</refresh_rate>
+        </resolution>
+        <!-- 竖屏降采样（带宽/解码吃紧时用） -->
+        <resolution>
+            <width>810</width>
+            <height>1800</height>
+            <refresh_rate>60</refresh_rate>
+        </resolution>
+        <!-- 横屏降采样 -->
+        <resolution>
+            <width>1800</width>
+            <height>810</height>
+            <refresh_rate>60</refresh_rate>
+        </resolution>
+    </resolutions>
+    <options>
+        <CustomEdid>false</CustomEdid>
+        <PreventSpoof>false</PreventSpoof>
+        <EdidCeaOverride>false</EdidCeaOverride>
+        <!-- 硬件光标开关：false 时实测 mss 抓不到光标（虚拟屏上光标不绘制），
+             先试 true 看驱动是否会把它合成进帧缓冲 -->
+        <HardwareCursor>true</HardwareCursor>
+        <SDR10bit>false</SDR10bit>
+        <HDRPlus>false</HDRPlus>
+        <logging>false</logging>
+        <debuglogging>false</debuglogging>
+    </options>
+</vdd_settings>

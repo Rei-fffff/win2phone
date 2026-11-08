@@ -1,12 +1,13 @@
-# Win2Phone — 把安卓手机做成 Windows 的第二块屏（M0 骨架）
+# Win2Phone — 把安卓手机做成 Windows 的第二块屏
 
 目标：**手机是一块真正的 Windows 扩展显示器**，可以从主屏把任意窗口拖过去。
 WiFi / USB 双通道、横竖屏、触控回传、以及「虚拟屏摆在主屏哪一侧」都可切换。
 
-> 状态：**M0.2 联调通过**。USB / 网络两种连接方式、全屏投屏 + 悬浮断开按钮、
-> PC 控制面板（摆放位置 + 横竖屏）都已真机验证通过。
-> **VDD 驱动仍未安装**（调试阶段先抓主屏），Win+P 扩展与触控/摆放位置的
-> Windows 实际生效与否尚未验证（面板会明确提示 `display_applied=false`）。
+> 状态：**M1 已跑通**。虚拟显示器驱动已安装，手机显示的是真正的第三块屏
+> （1080×2400 / 2400×1080 原生比例，1:1 无变形），鼠标光标已合成进画面，
+> 触控坐标按物理像素映射，断开保留虚拟屏、退出 host 时才摘除。
+>
+> 启动方式：双击工程根目录的 **`start.bat`**（详见文末 M1 小节）。
 
 ## 需求定稿
 
@@ -254,6 +255,84 @@ cd /d/Files/Apps/win2phone/pc
 | 网络页填 `127.0.0.1` 开始投屏 | `connect gen=5` → 正常出画 |
 
 截图：`p1_connect.png`、`p2_address.png`、`p3_stream.png`、`p4_portrait.png`。
+
+---
+
+# M1 · 真扩展屏（2026-11-08）
+
+M0 只是把主屏镜像到手机；M1 才真正做到「系统里多一块屏，窗口能拖过去」。
+这一节记录**怎么用**和**踩过的坑**，坑都写清楚免得重犯。
+
+## 怎么启动
+
+**双击工程根目录的 `start.bat`。** 它做三件事：
+
+1. `adb reverse tcp:19010/19011`（没插手机时报错也无所谓，WiFi 模式用不上）
+2. 另开一个窗口起控制面板，自动打开 <http://127.0.0.1:19012/>
+3. 在**当前窗口**里跑 `host.py`——这个窗口就是主机，**关掉它 = 停止并摘除虚拟屏**
+
+手改参数时直接用命令行，默认值已经能跑：
+
+```bash
+cd pc
+.venv/Scripts/python.exe -u host.py                 # 默认 30fps / 14M / 竖屏 / 右侧
+.venv/Scripts/python.exe -u host.py --landscape 1800x810   # 带宽吃紧时降一档
+.venv/Scripts/python.exe host.py --list             # 看显示器与 VDD 状态
+```
+
+## VDD 安装（一次性）
+
+```powershell
+winget install --id=VirtualDrivers.Virtual-Display-Driver -e --source winget
+```
+
+winget 只装「控制端 + 签名驱动包」，**驱动本体要单独装一次**（管理员）：
+
+```powershell
+# 参数按实际版本目录调整
+$SRC="$env:LOCALAPPDATA\Microsoft\WinGet\Packages\VirtualDrivers.Virtual-Display-Driver_Microsoft.Winget.Source_8wekyb3d8bbwe"
+mkdir C:\VirtualDisplayDriver -Force
+copy pc\vdd_settings.xml C:\VirtualDisplayDriver\vdd_settings.xml
+& "$SRC\Dependencies\devcon.exe" install "$SRC\SignedDrivers\x86\VDD\MttVDD.inf" Root\MttVDD
+```
+
+`pc/vdd_settings.xml` 里定义了 4 个模式，全部按手机原生 9:20 比例：
+`1080x2400` / `2400x1080` / `810x1800` / `1800x810`。
+**改完要重启虚拟显示器设备**才生效（`devcon restart Root\MttVDD`，管理员）。
+
+> ⚠️ 更新显卡驱动前先卸载 VDD，否则可能黑屏（VDD 官方 README 有说明）。
+
+## M1 改了什么
+
+| 方面 | M0 | M1 |
+|---|---|---|
+| 画面来源 | 主屏镜像 | 真正的 VDD 虚拟屏，独立任务栏、窗口可拖 |
+| 分辨率 | 固定 1280×800 缩放 | 手机原生 1080×2400 / 2400×1080，1:1 |
+| 显示器定位 | 手填 `--device 1`（指向死设备） | 按 DeviceString 自动找 VDD，索引全部废弃 |
+| 横竖屏 | 只改编码尺寸，画面被拉伸 | 真的改虚拟屏分辨率 + 重排位置，手机同步旋转 |
+| 光标 | 画面里没有光标 | PC 端合成进帧，手机能看到箭头 |
+| 触控 | 用手写的启动快照，切边后全偏 | 每次会话重新解析几何，物理像素映射 |
+| 断开 | 无处理 | 保留虚拟屏；Ctrl+C 退出 host 才摘除 |
+| 启动 | 两个终端 + 长参数 | `start.bat` |
+
+## M1 踩的坑（都验证过，别再改回去）
+
+| 现象 | 根因 | 结论 |
+|---|---|---|
+| 所有显示器操作报「句柄无效」 | `--device 1` 指向 `\\.\DISPLAY2`，这是**没有接显示器的潜伏输出**，`EnumDisplaySettings` 必失败 | 只认 `EnumDisplaySettings` 成功的设备 |
+| 设备名写死就崩 | VDD 重启一次后名字从 `DISPLAY9` 变成 `DISPLAY10` | 永远按 `DeviceString == "Virtual Display Driver"` 重新查找 |
+| `SetDisplayConfig` 返回 0 但没效果 | 用了 `QDC_ALL_PATHS`(0x1) | **必须用 `QDC_ONLY_ACTIVE_PATHS`(0x2)**，否则静默失败 |
+| `QueryDisplayConfig` 恒返回 87 | 本机该 API 对所有 flag/缓冲区组合都失败（结构体尺寸已验证 72/64 正确） | 放弃手改 path 数组，改用 `SDC_TOPOLOGY_EXTEND / _INTERNAL` |
+| 虚拟屏上抓不到鼠标光标 | mss 走 GDI `BitBlt`，光标在独立图层；虚拟屏上不合成（实测移动光标 0 像素变化，主屏 9.4KB）。VDD 的 `HardwareCursor` 开/关都一样 | 自己用 `GetCursorInfo`+`GetIconInfo`+`GetDIBits` 画 |
+| 光标/触控坐标整体偏移 | 进程不是 DPI-aware，虚拟桌面被报成 2912×1920（实际 3640×2400） | **必须在 `import mss` 之前**调 `SetProcessDpiAwarenessContext(-4)` |
+| 改完分辨率立刻查 mss 查不到 | Windows 需要一点时间才把新矩形反映到显示器枚举 | `monitor()` 里轮询 3 秒 |
+| 面板命令回复错位 | `hello` 时多发了一条 `orientation` | 一条命令只回一条消息；方向由 App 从 `status` 里读 |
+
+## 仍未做
+
+- 触控只映射到 `SendInput` 鼠标事件，没有 Windows 原生多点触控
+- 无鉴权、无加密、TCP 单客户端：只在可信局域网或 `adb reverse` 下用
+- 断开虚拟屏用的是「只保留内置屏」的拓扑，**如果接了真实外接显示器会被一起摘掉**
 
 > 仍未完成：VDD 驱动安装、Win+P「扩展」、触控坐标与 `side` 摆放位置在 Windows 侧的
 > 实机生效验证。

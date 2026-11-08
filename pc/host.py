@@ -1,32 +1,76 @@
-"""Win2Phone Windows host — M0.2.
+"""Win2Phone host — makes an Android phone a real extended Windows display.
 
-Capture a display -> FFmpeg H.264 -> TCP NAL stream (port 19010).
-A second TCP port (19011) carries newline-delimited JSON control messages.
-Multiple control clients may connect at once (phone App + PC control panel);
-side / orientation changes are broadcast and can restart the video session.
+The phone is not mirrored: a Virtual Display Driver (VDD) monitor is created,
+sized to the phone's own aspect ratio, positioned on the chosen edge of the
+primary display, and only *that* monitor is streamed. Windows treats it as a
+normal second screen, so windows can be dragged onto it.
 
-    python host.py --list
-    python host.py --monitor 1 --scale 1280x800 --codec auto
+Pipeline
+    mss grab(VDD) -> composite mouse cursor -> FFmpeg H.264 -> TCP 19010
+    control (JSON lines) on TCP 19011, shared by the phone app and the PC panel
+
+Design notes that are not obvious from the code:
+  * DPI awareness must be enabled before mss is imported, otherwise every
+    coordinate (cursor, touch, monitor rects) is silently virtualised.
+  * The VDD's \\\\.\\DISPLAYn name changes across device restarts, so it is
+    always re-resolved by DeviceString, never by index.
+  * mss/BitBlt never captures the cursor on an IddCx display, so we draw it.
+  * The virtual display stays attached while the host runs (so a phone that
+    reconnects does not make Windows re-enumerate displays) and is detached
+    only on exit.
 
 See README.md and protocol.md.
 """
 from __future__ import annotations
 
 import ctypes
-import json
-import queue
-import socket
-import struct
-import subprocess
-import sys
-import threading
-import time
 
-import mss
-import win32api
 
-import display as disp
-from config import parse_args
+def _enable_dpi_awareness() -> None:
+    """Run before mss/pywin32 read any display geometry.
+
+    A DPI-unaware process sees a scaled virtual desktop (2912x1920 instead of
+    3640x2400 on this machine) and SetCursorPos/GetCursorInfo operate in
+    virtualised coordinates — which breaks cursor compositing *and* touch
+    injection. mss latches unaware mode when imported, so order matters.
+    """
+    try:
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+_enable_dpi_awareness()
+
+import json                      # noqa: E402
+import os                        # noqa: E402
+import queue                     # noqa: E402
+import socket                    # noqa: E402
+import struct                    # noqa: E402
+import subprocess                # noqa: E402
+import sys                       # noqa: E402
+import threading                 # noqa: E402
+import time                      # noqa: E402
+
+import mss                       # noqa: E402
+import win32api                  # noqa: E402
+
+import display as disp           # noqa: E402
+from config import Config, parse_args   # noqa: E402
+from cursor import CursorCompositor     # noqa: E402
+
+SIDE_LABEL = {"right": "右", "left": "左", "top": "上", "bottom": "下"}
+
 
 # ---------------------------------------------------------------- Win32 input
 PUL = ctypes.POINTER(ctypes.c_ulong)
@@ -61,31 +105,37 @@ def _send_mouse(flags: int, x: int = 0, y: int = 0) -> None:
     _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
 
 
-def inject_touch(monitor: dict, nx: float, ny: float, action: str) -> None:
-    """Map normalized phone coords -> absolute desktop coords -> mouse event."""
+def inject_touch(mon: dict, nx: float, ny: float, action: str) -> None:
+    """Map phone-normalised (0..1) coords onto this monitor, then click.
+
+    ``mon`` must be the *current* rectangle: after a side or resolution change
+    the old one points at empty desktop.
+    """
+    if not mon:
+        return
     vx = _user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
     vy = _user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
     vw = _user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
     vh = _user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
-    tx = monitor["left"] + max(0.0, min(1.0, nx)) * monitor["width"]
-    ty = monitor["top"] + max(0.0, min(1.0, ny)) * monitor["height"]
+    tx = mon["left"] + max(0.0, min(1.0, nx)) * mon["width"]
+    ty = mon["top"] + max(0.0, min(1.0, ny)) * mon["height"]
     ax = int((tx - vx) * 65535 / max(vw - 1, 1))
     ay = int((ty - vy) * 65535 / max(vh - 1, 1))
     ax, ay = max(0, min(65535, ax)), max(0, min(65535, ay))
     move = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE
     if action == "down":
         _send_mouse(move, ax, ay)
-        _send_mouse(MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE, ax, ay)
+        _send_mouse(MOUSEEVENTF_LEFTDOWN, ax, ay)
     elif action == "up":
+        _send_mouse(MOUSEEVENTF_LEFTUP, ax, ay)
         _send_mouse(move, ax, ay)
-        _send_mouse(MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE, ax, ay)
     else:
         _send_mouse(move, ax, ay)
 
 
 # ------------------------------------------------------------ Annex-B framing
 def split_annexb(buf: bytearray):
-    """Yield complete NAL units, retaining the trailing incomplete one."""
+    """Yield complete NAL units, keeping the trailing incomplete one in ``buf``."""
     while True:
         first = buf.find(b"\x00\x00\x01")
         if first < 0:
@@ -94,15 +144,28 @@ def split_annexb(buf: bytearray):
         if second < 0:
             return
         nal = bytes(buf[first:second])
-        if nal.endswith(b"\x00"):   # leading zero belonging to next 4-byte start code
+        if nal.endswith(b"\x00"):   # leading zero of the next 4-byte start code
             nal = nal[:-1]
         yield nal
         del buf[:second]
 
 
 # ------------------------------------------------------------------- Encoding
-def pick_codec(cfg) -> str:
-    """Probe NVENC by actually encoding frames (a listed encoder can still fail)."""
+def resolve_ffmpeg(given: str) -> str:
+    if given:
+        return given
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and os.path.exists(exe):
+            return exe
+    except Exception:
+        pass
+    return "ffmpeg"
+
+
+def pick_codec(cfg: Config) -> str:
+    """Probe NVENC by actually encoding: a listed encoder can still fail."""
     if cfg.codec != "auto":
         return cfg.codec
     try:
@@ -116,8 +179,7 @@ def pick_codec(cfg) -> str:
         ]
         result = subprocess.run(
             probe, input=b"\x40" * (640 * 360 * 4 * 2),
-            capture_output=True, timeout=20,
-        )
+            capture_output=True, timeout=20)
         if result.returncode == 0 and result.stdout:
             return "nvenc"
     except Exception:
@@ -125,22 +187,8 @@ def pick_codec(cfg) -> str:
     return "x264"
 
 
-def effective_size(cfg, w: int, h: int) -> tuple[int, int]:
-    """Encoded resolution (after optional --scale). Reported in hello/status."""
-    if cfg.scale:
-        try:
-            sw, sh = (int(x) for x in cfg.scale.lower().split("x"))
-            if sw > 0 and sh > 0:
-                return sw, sh
-        except ValueError:
-            pass
-    return w, h
-
-
-def ffmpeg_cmd(cfg, w: int, h: int) -> list[str]:
-    sw, sh = effective_size(cfg, w, h)
-    vf = ["-vf", f"scale={sw}:{sh}:flags=fast_bilinear"] if (sw, sh) != (w, h) else []
-    if cfg.codec == "nvenc":
+def ffmpeg_cmd(cfg: Config, w: int, h: int, codec: str) -> list[str]:
+    if codec == "nvenc":
         # FFmpeg 9.x rejects `-rc cbr-ld-h264` ("Undefined constant 'ld-h264'").
         venc = ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ull"]
     else:
@@ -149,117 +197,168 @@ def ffmpeg_cmd(cfg, w: int, h: int) -> list[str]:
         cfg.ffmpeg, "-hide_banner", "-loglevel", "error",
         "-f", "rawvideo", "-pix_fmt", "bgra",
         "-s", f"{w}x{h}", "-r", str(cfg.fps), "-i", "pipe:0",
-        "-an", *vf, *venc, "-b:v", cfg.bitrate, "-g", str(cfg.fps),
+        "-an", *venc, "-b:v", cfg.bitrate, "-g", str(cfg.fps),
         # B-frames force reordering in MediaCodec; forbidden for a live desktop.
         "-bf", "0",
         "-pix_fmt", "yuv420p", "-f", "h264", "pipe:1",
     ]
 
 
-# ------------------------------------------------------------ Shared state hub
-class ControlHub:
-    """Shared state for all control clients and the video server.
+# ------------------------------------------------------------ virtual display
+class VirtualDisplay:
+    """Wraps display.py with the attach/configure/resolve dance."""
 
-    The phone App and the PC control panel both connect to 19011. Any client may
-    change side/orientation; the resulting state is broadcast to everyone so the
-    phone can rotate its Activity and the panel can refresh its buttons.
-    """
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self.device = ""
+
+    def size_for(self, orientation: str) -> tuple[int, int]:
+        return self.cfg.landscape if orientation == "landscape" else self.cfg.portrait
+
+    def ensure(self) -> str:
+        v = disp.find_virtual()
+        if v is None:
+            raise RuntimeError(
+                "找不到虚拟显示器驱动（VDD）。先安装：\n"
+                "  winget install --id=VirtualDrivers.Virtual-Display-Driver "
+                "-e --source winget\n"
+                "然后用管理员权限装一次驱动本体（见 README 的 VDD 小节）。")
+        if not v["usable"]:
+            print("[vdd] 虚拟屏存在但未接入桌面，正在扩展…")
+            disp.attach()
+            for _ in range(40):
+                time.sleep(0.1)
+                v = disp.find_virtual()
+                if v and v["usable"]:
+                    break
+        if not v or not v["usable"]:
+            raise RuntimeError("虚拟屏无法接入桌面（SetDisplayConfig EXTEND 未生效）")
+        self.device = v["name"]
+        print(f"[vdd] {self.device}  {v['width']}x{v['height']} "
+              f"@ ({v['left']},{v['top']})")
+        return self.device
+
+    def configure(self, orientation: str, side: str) -> tuple[int, int, int, int]:
+        w, h = self.size_for(orientation)
+        geo = disp.place(self.device, side, w, h)
+        print(f"[vdd] orientation={orientation} {geo[0]}x{geo[1]} "
+              f"@ ({geo[2]},{geo[3]}) side={side}")
+        return geo
+
+    def monitor(self, timeout: float = 3.0) -> tuple[int, dict]:
+        """The mss monitor entry that matches the virtual display exactly.
+
+        Polled: right after a mode/position change Windows needs a moment before
+        the new rectangle shows up in the monitor list.
+        """
+        deadline = time.time() + timeout
+        geo = None
+        seen = []
+        while time.time() < deadline:
+            geo = disp.geometry(self.device)
+            if geo is None:
+                raise RuntimeError("虚拟屏已被摘除")
+            with mss.mss() as sct:
+                seen = [dict(m) for m in sct.monitors[1:]]
+                for i, m in enumerate(sct.monitors[1:], start=1):
+                    # geometry() is (w, h, left, top) — keep that order.
+                    if ((m["width"], m["height"], m["left"], m["top"]) == geo):
+                        return i, dict(m)
+            time.sleep(0.15)
+        raise RuntimeError(f"mss 里没有与虚拟屏 {geo} 匹配的显示器；"
+                           f"mss 当前为 {seen}")
+
+
+# ------------------------------------------------------------ shared state hub
+class ControlHub:
+    """State shared by the phone app, the PC panel and the video session."""
 
     SIDES = ("right", "left", "top", "bottom")
 
-    def __init__(self, cfg, device, mon, w: int, h: int):
+    def __init__(self, cfg: Config, vd: VirtualDisplay | None, mon: dict,
+                 codec: str) -> None:
         self.cfg = cfg
-        self.device = device
+        self.vd = vd
         self.mon = mon
-        self.src_w, self.src_h = w, h
+        self.codec = codec
         self.lock = threading.Lock()
         self.write_lock = threading.Lock()
-        self.clients: dict[socket.socket, str] = {}   # conn -> role
-        self.side = cfg.side if cfg.side in self.SIDES else "right"
-        self.orientation = "landscape"
-        self.fixed_scale = cfg.scale or ""
-        self.display_note = ""
-        self.display_applied = False
+        self.clients: dict[socket.socket, str] = {}
+        self.side = cfg.side
+        self.orientation = "portrait"
+        self.note = "调试模式（--monitor）：不管理虚拟屏" if vd is None else ""
+        self.applied = vd is not None
         self.restart = threading.Event()
-        self.apply_scale()
 
-    # ---- display geometry -------------------------------------------------
-    def apply_scale(self) -> None:
-        """Rotate the --scale box when the phone is in portrait."""
-        if not self.fixed_scale:
-            self.cfg.scale = ""
+    # ---- state changes ----------------------------------------------------
+    def refresh(self) -> None:
+        if self.vd is None:
             return
         try:
-            sw, sh = (int(x) for x in self.fixed_scale.lower().split("x"))
-        except ValueError:
-            sw, sh = 1280, 800
-        want_portrait = self.orientation == "portrait"
-        if want_portrait and sw > sh:
-            sw, sh = sh, sw
-        if not want_portrait and sh > sw:
-            sw, sh = sh, sw
-        self.cfg.scale = f"{sw}x{sh}"
+            _, m = self.vd.monitor()
+            self.mon = m
+        except Exception as exc:
+            print(f"[vdd] monitor refresh failed: {exc}")
 
     def set_side(self, value: str) -> str:
-        """Try to move the virtual display; always record the requested side."""
         if value not in self.SIDES:
             return f"unknown side: {value}"
         self.side = value
+        if self.vd is None:
+            return "调试模式：虚拟屏位置未管理"
         try:
-            x, y = disp.set_side(self.device, value)
-            self.display_applied = True
-            self.display_note = f"Windows 虚拟屏已移动到 ({x},{y})"
+            x, y = disp.set_side(self.vd.device, value)
+            self.applied = True
+            self.note = f"虚拟屏已移到主屏{SIDE_LABEL[value]}侧 ({x},{y})"
             print(f"[control] side -> {value} @ ({x},{y})")
         except Exception as exc:
-            self.display_applied = False
-            self.display_note = (
-                "位置已记录，但 Windows 显示器设置未生效："
-                "尚未安装虚拟显示器驱动（VDD）或 --device 指向了不存在的显示器"
-            )
-            print(f"[control] side -> {value} (not applied: {exc})")
-        return self.display_note
+            self.applied = False
+            self.note = f"位置未应用：{exc}"
+            print(f"[control] side -> {value} failed: {exc}")
+        self.refresh()
+        return self.note
 
     def set_orientation(self, value: str) -> str:
         if value not in ("portrait", "landscape"):
             return f"unknown orientation: {value}"
         self.orientation = value
-        self.apply_scale()
-        ew, eh = effective_size(self.cfg, self.src_w, self.src_h)
+        if self.vd is None:
+            self.restart.set()
+            return "调试模式：虚拟屏方向未管理"
         try:
-            disp.set_resolution(self.device, ew, eh)
-            self.display_applied = True
-            self.display_note = f"虚拟屏分辨率 -> {ew}x{eh}"
+            geo = self.vd.configure(value, self.side)
+            self.applied = True
+            self.note = f"虚拟屏 {geo[0]}x{geo[1]} @ ({geo[2]},{geo[3]})"
         except Exception as exc:
-            self.display_applied = False
-            self.display_note = (
-                f"编码分辨率改为 {ew}x{eh}；Windows 显示器设置未生效"
-                "（尚未安装 VDD）"
-            )
-            print(f"[control] resolution {ew}x{eh} (display not applied: {exc})")
-        # Force the video session to restart so the new scale takes effect.
+            self.applied = False
+            self.note = f"方向切换失败：{exc}"
+            print(f"[control] orientation -> {value} failed: {exc}")
+        self.refresh()
+        # Only the encoder/decoder need rebuilding; geometry already changed.
         self.restart.set()
-        print(f"[control] orientation -> {value}, scale={self.cfg.scale or 'none'}, "
-              "video session will restart")
-        return self.display_note
+        print(f"[control] orientation -> {value}; video session restarts")
+        return self.note
 
-    # ---- status & messaging ----------------------------------------------
+    # ---- status -----------------------------------------------------------
     def status(self, msg_type: str = "status") -> dict:
-        ew, eh = effective_size(self.cfg, self.src_w, self.src_h)
         return {
             "type": msg_type,
             "side": self.side,
             "orientation": self.orientation,
-            "width": ew,
-            "height": eh,
-            "source_width": self.src_w,
-            "source_height": self.src_h,
-            "scale": self.cfg.scale or "none",
+            "width": self.mon["width"],
+            "height": self.mon["height"],
+            "source_width": self.mon["width"],
+            "source_height": self.mon["height"],
+            "left": self.mon["left"],
+            "top": self.mon["top"],
             "fps": self.cfg.fps,
-            "codec": self.cfg.codec,
-            "display_applied": self.display_applied,
-            "note": self.display_note,
+            "bitrate": self.cfg.bitrate,
+            "codec": self.codec,
+            "display_applied": self.applied,
+            "note": self.note,
         }
 
+    # ---- client bookkeeping ----------------------------------------------
     def register(self, conn: socket.socket, role: str = "") -> None:
         with self.lock:
             self.clients[conn] = role
@@ -289,98 +388,104 @@ class ControlHub:
             self.send_to(conn, obj)
 
 
-# ---------------------------------------------------------------- Video server
-def serve_stream(cfg, conn: socket.socket, stop: threading.Event,
+# ---------------------------------------------------------------- video server
+def serve_stream(cfg: Config, conn: socket.socket, stop: threading.Event,
                  hub: ControlHub) -> None:
-    """Serve exactly one client and always return when that client goes away.
+    """Serve exactly one client and always return when it goes away.
 
-    Without the `alive` flag, a disconnected client leaves the capture loop
+    Without the ``alive`` flag a disconnected client leaves the capture loop
     writing into an FFmpeg pipe nobody drains; the session then blocks forever
-    and video_server never accepts another connection (CLOSE_WAIT on the port).
-    `hub.restart` lets the control panel end this session on demand.
+    and video_server never accepts another connection.
     """
     hub.restart.clear()
-    cfg.codec = pick_codec(cfg)
+    hub.refresh()
+
+    if cfg.monitor is not None:
+        with mss.mss() as sct:
+            if cfg.monitor >= len(sct.monitors):
+                raise RuntimeError(f"monitor {cfg.monitor} not found; "
+                                   f"available: {len(sct.monitors)}")
+            mon = dict(sct.monitors[cfg.monitor])
+    else:
+        _, mon = hub.vd.monitor()
+        hub.mon = mon
+
+    w, h = mon["width"], mon["height"]
+    print(f"[capture] {w}x{h} @ ({mon['left']},{mon['top']}) codec={hub.codec}")
+
+    proc = subprocess.Popen(
+        ffmpeg_cmd(cfg, w, h, hub.codec),
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    chunks: queue.Queue = queue.Queue()
     alive = threading.Event()
     alive.set()
-    with mss.mss() as sct:
-        if cfg.monitor_index >= len(sct.monitors):
-            raise RuntimeError(
-                f"monitor {cfg.monitor_index} not found; available: {sct.monitors}"
-            )
-        mon = sct.monitors[cfg.monitor_index]
-        w, h = mon["width"], mon["height"]
-        ew, eh = effective_size(cfg, w, h)
-        print(f"[capture] monitor {cfg.monitor_index}: {w}x{h} -> {ew}x{eh} "
-              f"@ ({mon['left']},{mon['top']})  codec={cfg.codec}")
 
-        proc = subprocess.Popen(
-            ffmpeg_cmd(cfg, w, h),
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-        chunks: queue.Queue = queue.Queue()
+    def read_stdout() -> None:
+        while True:
+            data = proc.stdout.read(65536)
+            if not data:
+                break
+            chunks.put(data)
+        chunks.put(None)
 
-        def read_stdout() -> None:
-            while True:
-                data = proc.stdout.read(65536)
-                if not data:
-                    break
-                chunks.put(data)
-            chunks.put(None)
+    threading.Thread(target=read_stdout, daemon=True).start()
 
-        threading.Thread(target=read_stdout, daemon=True).start()
+    buf = bytearray()
 
-        buf = bytearray()
-
-        def pump() -> None:
-            while alive.is_set():
-                data = chunks.get()
-                if data is None:
+    def pump() -> None:
+        while alive.is_set():
+            data = chunks.get()
+            if data is None:
+                alive.clear()
+                return
+            buf.extend(data)
+            for nal in split_annexb(buf):
+                try:
+                    conn.sendall(struct.pack(">I", len(nal)) + nal)
+                except OSError:
                     alive.clear()
                     return
-                buf.extend(data)
-                for nal in split_annexb(buf):
-                    try:
-                        conn.sendall(struct.pack(">I", len(nal)) + nal)
-                    except (ConnectionResetError, BrokenPipeError, OSError):
-                        alive.clear()
-                        return
 
-        threading.Thread(target=pump, daemon=True).start()
+    threading.Thread(target=pump, daemon=True).start()
 
-        interval = 1.0 / cfg.fps
-        try:
+    compositor = CursorCompositor()
+    interval = 1.0 / cfg.fps
+    try:
+        with mss.mss() as sct:
             while (not stop.is_set() and alive.is_set()
                    and not hub.restart.is_set()):
                 t0 = time.time()
                 frame = sct.grab(mon)
-                proc.stdin.write(frame.bgra)
+                # mss/BitBlt never sees the cursor on an IddCx display.
+                compositor.draw(frame.raw, mon)
+                proc.stdin.write(frame.raw)
                 proc.stdin.flush()
                 remain = interval - (time.time() - t0)
                 if remain > 0:
                     time.sleep(remain)
-        except (BrokenPipeError, OSError) as exc:
-            print(f"[capture] stream stopped: {exc}")
-        finally:
-            alive.clear()
+    except (BrokenPipeError, OSError, mss.exception.ScreenShotError) as exc:
+        print(f"[capture] stream stopped: {exc}")
+    finally:
+        alive.clear()
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
             try:
-                proc.stdin.close()
+                proc.kill()
             except Exception:
                 pass
-            try:
-                proc.terminate()
-                proc.wait(timeout=2)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-            err = proc.stderr.read().decode("utf-8", "replace") if proc.stderr else ""
-            if err.strip():
-                print("[ffmpeg]", err.strip()[:500])
+        err = proc.stderr.read().decode("utf-8", "replace") if proc.stderr else ""
+        if err.strip():
+            print("[ffmpeg]", err.strip()[:500])
 
 
-def video_server(cfg, stop: threading.Event, hub: ControlHub) -> None:
+def video_server(cfg: Config, stop: threading.Event, hub: ControlHub) -> None:
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", cfg.video_port))
@@ -399,33 +504,34 @@ def video_server(cfg, stop: threading.Event, hub: ControlHub) -> None:
             print(f"[video] session ended: {exc}")
         finally:
             conn.close()
-            if hub.restart.is_set():
-                print("[video] session closed: applying new orientation/scale")
-            else:
-                print("[video] session closed, waiting for next client")
+            print("[video] session closed, waiting for next client")
     srv.close()
 
 
-# --------------------------------------------------------------- Control server
+# -------------------------------------------------------------- control server
 def handle(msg: dict, hub: ControlHub, conn: socket.socket) -> dict | None:
     kind = msg.get("type")
     if kind == "hello":
         hub.set_role(conn, str(msg.get("client", "")))
+        # Exactly one reply per command: the phone app applies `orientation`
+        # from this status, and panel.py relies on the 1:1 request/response
+        # pairing of its short-lived connections.
         return hub.status("hello")
     if kind == "query":
         return hub.status()
     if kind == "touch":
-        inject_touch(hub.mon, float(msg.get("x", 0)), float(msg.get("y", 0)),
-                     str(msg.get("action", "move")))
+        try:
+            inject_touch(hub.mon, float(msg.get("x", 0)), float(msg.get("y", 0)),
+                         str(msg.get("action", "move")))
+        except (TypeError, ValueError):
+            pass
         return None
     if kind == "side":
         value = str(msg.get("value", ""))
         if value not in ControlHub.SIDES:
             return {"type": "error", "message": f"unknown side: {value}"}
-        note = hub.set_side(value)
+        hub.set_side(value)
         st = hub.status()
-        # The sender gets `st` as its direct reply; exclude it from the broadcast
-        # so it does not receive the same message twice.
         hub.broadcast(st, exclude=conn)
         return st
     if kind == "orientation":
@@ -473,15 +579,13 @@ def control_session(hub: ControlHub, conn: socket.socket, addr,
         print("[control] client disconnected")
 
 
-def control_server(cfg, stop: threading.Event, hub: ControlHub) -> None:
-    devs = disp.devices()
+def control_server(cfg: Config, stop: threading.Event, hub: ControlHub) -> None:
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", cfg.control_port))
     srv.listen(5)
     srv.settimeout(1.0)
-    print(f"[control] listening on {cfg.control_port}; "
-          f"device={hub.device}; clients can connect concurrently")
+    print(f"[control] listening on {cfg.control_port}")
     while not stop.is_set():
         try:
             conn, addr = srv.accept()
@@ -492,37 +596,41 @@ def control_server(cfg, stop: threading.Event, hub: ControlHub) -> None:
     srv.close()
 
 
-# ------------------------------------------------------------------------ Main
+# ------------------------------------------------------------------------ main
 def main() -> int:
     cfg = parse_args()
     if cfg.list_only:
-        with mss.mss() as sct:
-            print("mss monitors:")
-            for i, m in enumerate(sct.monitors):
-                print(f"  [{i}] {m}")
         print(disp.describe())
+        with mss.mss() as sct:
+            for i, m in enumerate(sct.monitors):
+                print(f"  mss[{i}] {m}")
         return 0
 
-    print("Win2Phone host M0.2 — Ctrl+C to stop")
-    print(disp.describe())
-    # Resolve `auto` once so status/hello always report the real encoder.
+    cfg.ffmpeg = resolve_ffmpeg(cfg.ffmpeg)
+    print("Win2Phone host — Ctrl+C 退出")
+    print(f"[init] ffmpeg = {cfg.ffmpeg}")
+
+    vd: VirtualDisplay | None = None
+    if cfg.monitor is not None:
+        with mss.mss() as sct:
+            if cfg.monitor >= len(sct.monitors):
+                print(f"[error] monitor {cfg.monitor} 不存在，可用 0..{len(sct.monitors)-1}")
+                return 2
+            mon = dict(sct.monitors[cfg.monitor])
+        print(f"[init] 调试模式：抓 mss[{cfg.monitor}] {mon}")
+    else:
+        vd = VirtualDisplay(cfg)
+        try:
+            vd.ensure()
+            vd.configure("portrait", cfg.side)
+        except Exception as exc:
+            print(f"[error] {exc}")
+            return 2
+        _, mon = vd.monitor()
+
     cfg.codec = pick_codec(cfg)
     print(f"[init] encoder = {cfg.codec}")
-
-    devs = disp.devices()
-    device = (devs[cfg.device_index]["name"] if cfg.device_index < len(devs)
-              else (devs[-1]["name"] if devs else None))
-    with mss.mss() as sct:
-        mon = (sct.monitors[cfg.monitor_index]
-               if cfg.monitor_index < len(sct.monitors) else sct.monitors[1])
-        w, h = mon["width"], mon["height"]
-
-    hub = ControlHub(cfg, device, mon, w, h)
-
-    if cfg.side in ControlHub.SIDES:
-        hub.set_side(cfg.side)
-    else:
-        print("[init] display repositioning skipped (--side none)")
+    hub = ControlHub(cfg, vd, mon, cfg.codec)
 
     stop = threading.Event()
     threads = [
@@ -531,12 +639,22 @@ def main() -> int:
     ]
     for t in threads:
         t.start()
+    print(f"[init] 手机端 USB 连接前先执行：\n"
+          f"        adb reverse tcp:{cfg.video_port} tcp:{cfg.video_port}\n"
+          f"        adb reverse tcp:{cfg.control_port} tcp:{cfg.control_port}")
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\nstopping...")
+        print("\n[main] 停止中…")
         stop.set()
+    finally:
+        if vd is not None:
+            try:
+                disp.detach()
+                print("[vdd] 虚拟屏已摘除")
+            except Exception as exc:
+                print(f"[vdd] 摘除失败：{exc}")
     return 0
 
 

@@ -149,10 +149,10 @@ function paint(j){
   document.getElementById('v-orient').textContent =
     (j.orientation==='portrait'?'竖屏':'横屏')+' ('+(j.orientation||'—')+')';
   document.getElementById('v-res').textContent =
-    (j.width||'?')+'×'+(j.height||'?')+'（源 '+(j.source_width||'?')+'×'+
-    (j.source_height||'?')+'，scale '+(j.scale||'none')+'）';
+    (j.width||'?')+'×'+(j.height||'?')+'（虚拟屏位置 '+(j.left ?? '?')+','+
+    (j.top ?? '?')+'）';
   document.getElementById('v-codec').textContent =
-    (j.codec||'?')+' / '+(j.fps||'?')+' fps';
+    (j.codec||'?')+' / '+(j.fps||'?')+' fps / '+(j.bitrate||'?');
   document.getElementById('v-note').textContent = j.note || '正常';
 }
 function connected(ok,text){
