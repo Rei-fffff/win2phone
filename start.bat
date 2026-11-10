@@ -1,45 +1,47 @@
 @echo off
 setlocal
-title Win2Phone host
+title Win2Phone
 cd /d "%~dp0pc"
 
-set "PY=.venv\Scripts\python.exe"
-if not exist "%PY%" (
-  echo [error] virtualenv missing: %CD%\%PY%
-  echo.
-  echo Create it once:
-  echo     python -m venv .venv
-  echo     .venv\Scripts\python.exe -m pip install -r requirements.txt
-  echo.
-  pause
-  exit /b 1
-)
-
+set "PYW=.venv\Scripts\pythonw.exe"
 set "SLEEP=%SystemRoot%\System32\timeout.exe"
 
-echo [1/3] USB port forwarding
-set "ADB="
-where adb >nul 2>nul && set "ADB=adb"
-if not defined ADB if exist "D:\Program Files\Android\platform-tools\adb.exe" set "ADB=D:\Program Files\Android\platform-tools\adb.exe"
-if defined ADB (
-  "%ADB%" reverse tcp:19010 tcp:19010 >nul 2>nul
-  "%ADB%" reverse tcp:19011 tcp:19011 >nul 2>nul
-  echo       adb reverse 19010 / 19011 done
-) else (
-  echo       adb not found. For USB mode run these yourself:
-  echo           adb reverse tcp:19010 tcp:19010
-  echo           adb reverse tcp:19011 tcp:19011
-)
+if not exist "%PYW%" goto :noenv
 
-echo [2/3] control panel  ^(opens http://127.0.0.1:19012/^)
-start "Win2Phone panel" cmd /k %PY% -u panel.py --web
-%SLEEP% /t 2 /nobreak >nul 2>nul
+rem Already running? just open the page, never start a second host.
+netstat -ano | findstr ":19012" | findstr "LISTENING" >nul
+if not errorlevel 1 goto :open
 
-echo [3/3] host  --  close this window to stop and remove the virtual display
+start "" "%PYW%" app.py
+
+set /a n=0
+:wait
+%SLEEP% /t 1 /nobreak >nul 2>nul
+netstat -ano | findstr ":19012" | findstr "LISTENING" >nul
+if not errorlevel 1 goto :done
+set /a n+=1
+if %n% lss 15 goto :wait
+
+echo [error] console did not start. log follows:
+echo ------------------------------------------------------------
+if exist app.log type app.log
+echo ------------------------------------------------------------
+pause
+exit /b 1
+
+:open
+start "" "http://127.0.0.1:19012/"
+exit /b 0
+
+:noenv
+echo [error] virtualenv missing: %CD%\%PYW%
 echo.
-%PY% -u host.py --fps 30 --bitrate 14M
-
+echo Run once:
+echo     python -m venv .venv
+echo     .venv\Scripts\python.exe -m pip install -r requirements.txt
 echo.
-echo Host stopped; the virtual display has been detached.
-%SLEEP% /t 15 /nobreak >nul 2>nul
+pause
+exit /b 1
+
+:done
 exit /b 0

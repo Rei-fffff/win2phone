@@ -52,21 +52,20 @@
 
 ```
 win2phone/
-├─ start.bat                    一键启动：adb reverse → 面板 → 主机
+├─ start.bat                    一键启动（无控制台窗口，直接开页面）
 ├─ protocol.md                  视频帧格式与控制消息定义
 ├─ screenshot.png               手机端实拍（虚拟屏内容）
 ├─ p1_connect.png               手机端连接界面截图
 ├─ pc/                          Windows 端
+│  ├─ app.py                    控制台：主机 + 网页界面跑在同一个进程里
 │  ├─ host.py                   主机：抓屏 → H.264 → TCP、控制通道、虚拟屏生命周期
 │  ├─ display.py                虚拟显示器：枚举、接入/摘除、定位、改分辨率
 │  ├─ cursor.py                 把鼠标光标合成进视频帧
 │  ├─ config.py                 命令行参数
-│  ├─ panel.py                  PC 控制面板（标准库本地网页，零额外依赖）
 │  ├─ vdd_settings.xml          虚拟显示器的分辨率列表（要装到 C:\VirtualDisplayDriver）
 │  ├─ requirements.txt          Python 依赖
 │  ├─ selftest.py               不接手机时的视频通道回环自检
-│  ├─ fetch_wheels.py           可选：pip 装不上时直取 wheel 离线安装
-│  └─ start-panel.bat           只启动控制面板
+│  └─ fetch_wheels.py           可选：pip 装不上时直取 wheel 离线安装
 └─ android/                     手机端（Android Studio 工程，纯平台 API，无 AndroidX）
    └─ app/src/main/java/com/example/win2phone/MainActivity.kt
 ```
@@ -123,29 +122,46 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 ## 操作
 
-### 启动主机
+### 启动
 
-双击工程根目录的 **`start.bat`**。它会：
+双击工程根目录的 **`start.bat`**。只开一个浏览器页面，**没有控制台窗口**：
 
-1. 执行 `adb reverse tcp:19010/19011`（没插手机时报错可忽略，WiFi 模式用不上）
-2. 另开一个窗口启动控制面板，并自动打开 <http://127.0.0.1:19012/>
-3. 在**当前窗口**运行主机
+- 第一次双击 → 后台拉起 `app.py`，等端口就绪后自动打开 <http://127.0.0.1:19012/>
+- 已经在跑 → 直接帮你打开页面，不会再起第二份（避免两个主机抢端口）
 
 启动瞬间屏幕会闪一下——Windows 挂上了一块新显示器，正常现象。
 
-> **那个显示主机日志的窗口就是主机本身。关闭它（或 Ctrl+C）= 停止投屏并摘除虚拟屏。**
-> 不要用任务管理器强杀，那样会留下一个看不见的虚拟屏。
-
-需要改参数时直接跑命令行，默认值已经可用：
+需要改参数时用命令行（`python` 而不是 `pythonw`，可以看到实时输出）：
 
 ```bash
 cd pc
-.venv/Scripts/python.exe -u host.py                      # 30fps / 14M / 竖屏 / 主屏右侧
-.venv/Scripts/python.exe -u host.py --side left          # 摆到左侧
-.venv/Scripts/python.exe -u host.py --landscape 1800x810 # 横屏降一档，省带宽
-.venv/Scripts/python.exe -u host.py --fps 15 --bitrate 6M
-.venv/Scripts/python.exe host.py --list                  # 查看显示器与虚拟屏状态
+.venv/Scripts/python.exe app.py                        # 30fps / 14M / 竖屏 / 主屏右侧
+.venv/Scripts/python.exe app.py --side left            # 摆到左侧
+.venv/Scripts/python.exe app.py --landscape 1800x810   # 横屏降一档，省带宽
+.venv/Scripts/python.exe app.py --no-browser           # 不自动开浏览器
+.venv/Scripts/python.exe app.py --list                 # 只看显示器状态后退出
 ```
+
+### 页面
+
+所有操作都在同一个页面里，四块可折叠：
+
+| 区块 | 作用 |
+|---|---|
+| **状态** | 手机是否已连接、虚拟屏设备名、分辨率与坐标、编码器 / 帧率 / 码率 |
+| **① 手机摆放位置** | 上 / 左 / 右 / 下，决定鼠标从哪条边穿过去；改的是 Windows 里虚拟屏的实际位置 |
+| **② 屏幕方向** | 横屏 / 竖屏，切换会改虚拟屏分辨率，手机自动旋转并重连（约 1 秒中断） |
+| **③ USB 连接** | adb 设备状态、端口映射状态，可手动「重建端口映射」 |
+| **④ 日志** | 实时日志，等同于原来的控制台输出 |
+
+右上角两个按钮：
+
+| 按钮 | 作用 |
+|---|---|
+| 重启主机 | 改完参数或画面卡住时用；会保留虚拟屏，不闪屏 |
+| 退出 | 停止投屏并**移除虚拟显示器**，困在上面的窗口自动弹回主屏 |
+
+日志同时写一份到 `pc/app.log`，页面打不开时直接看这个文件。
 
 ### 连接手机
 
@@ -160,35 +176,29 @@ cd pc
 
 ![手机端](p1_connect.png)
 
-### 控制面板
-
-面板用来调整虚拟屏的摆放位置和方向，浏览器打开 <http://127.0.0.1:19012/>：
-
-| 区域 | 作用 |
-|---|---|
-| ① 上 / 左 / 右 / 下 | 把虚拟屏移到主屏对应一侧，鼠标就能从那条边穿过去 |
-| ② 横屏 / 竖屏 | 切换虚拟屏分辨率，手机端会自动旋转并重连（约 1 秒中断） |
-| ③ 当前状态 | 摆放位置、方向、分辨率、虚拟屏坐标、编码器 / 帧率 / 码率、是否真正生效 |
-
-面板每 2 秒自动刷新状态；主机没启动时会提示未连接并自动重试。
-
-想要独立的窗口版（需要该 Python 带 tkinter）：`python panel.py`。
-
 ### 停止
 
-关掉主机那个命令行窗口，虚拟屏会从 Windows 里消失，困在上面的窗口自动弹回主屏。
-手机端点「断开」只会停止投屏，虚拟屏保留，下次连上立刻出画。
+点页面右上角「退出」。虚拟屏会从 Windows 里消失。
+
+手机端点「断开」只会停止投屏，虚拟屏保留，下次连上立刻出画——这是刻意的：
+反复摘除/挂载虚拟屏会让 Windows 重新枚举显示器，每次都会闪屏。
+
+> 强杀进程（任务管理器结束 `pythonw.exe`）会留下一个看不见的虚拟屏。
+> 补救：重新 `start.bat`，再点一次「退出」即可。
 
 ## 常见问题
 
 | 现象 | 原因与处理 |
 |---|---|
-| 面板显示「虚拟屏未生效」/ `display_applied: false` | VDD 没装好，或虚拟屏没接入桌面。跑 `host.py --list` 确认有 `Virtual Display Driver` 且不是 detached |
-| 手机连不上，报 `ConnectException` | 主机没在跑，或 USB 模式没执行 `adb reverse`。先确认 19010 端口在监听 |
+| 页面提示「主机未运行」 | 看「④ 日志」里的报错。最常见是端口被占（提示已有一个主机在跑）或 VDD 没装好 |
+| 页面显示 `display_applied: false` | VDD 没装好或虚拟屏没接入桌面。跑 `app.py --list` 确认有 `Virtual Display Driver` 且不是 detached |
+| 手机连不上，报 `ConnectException` | 先看「③ USB 连接」里的端口映射状态，点一次「重建端口映射」。仍不行就查 19010 端口是否在监听 |
+| 之前能连，过一会儿就连不上 | USB 重新枚举会让 `adb reverse` 失效。控制台空闲时每 5 秒检查并自动重建，也可以手动重建 |
+| 启动就报端口占用 | 已经有一个 Win2Phone 在跑（可能是隐藏窗口的 `pythonw.exe`），先退掉它 |
 | 手机黑屏但显示「已连接」 | 看 logcat（`adb logcat -s Win2Phone`）里有没有解码器 `configure failed`。多半是分辨率超出硬解能力，用 `--landscape 1800x810` 降一档 |
-| 画面比例被拉伸 | 手机没有按虚拟屏的形状旋转。检查 `host.py --list` 里的虚拟屏尺寸与 App 实际方向是否一致 |
+| 画面比例被拉伸 | 手机没有按虚拟屏的形状旋转。检查虚拟屏尺寸与 App 实际方向是否一致 |
 | 画面上没有鼠标箭头 | 确认跑的是本仓库的 `host.py`（光标由 `cursor.py` 合成，系统不会画在 VDD 上） |
-| 窗口拖不到手机上 | 鼠标要从主屏的对应边缘一直移过去；用面板把虚拟屏摆到正确的一侧 |
+| 窗口拖不到手机上 | 鼠标要从主屏的对应边缘一直移过去；在「① 手机摆放位置」把虚拟屏摆到正确的一侧 |
 
 ## 已知限制
 

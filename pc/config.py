@@ -24,6 +24,7 @@ def parse_size(text: str) -> tuple[int, int]:
 class Config:
     video_port: int = 19010
     control_port: int = 19011
+    web_port: int = 19012
     fps: int = 30
     bitrate: str = "14M"
     codec: str = "auto"            # auto | nvenc | x264
@@ -33,13 +34,17 @@ class Config:
     ffmpeg: str = ""               # empty -> resolve from imageio-ffmpeg
     monitor: int | None = None     # debug: capture a physical monitor, no VDD
     list_only: bool = False
+    browser: bool = True           # app.py: open the page automatically
+    detach_on_exit: bool = True    # remove the virtual display when stopping
 
 
 def parse_args(argv: list[str] | None = None) -> Config:
     p = argparse.ArgumentParser(
-        description="Win2Phone host — turns an Android phone into a Windows display")
+        description="Win2Phone — turns an Android phone into a Windows display")
     p.add_argument("--video-port", type=int, default=19010)
     p.add_argument("--control-port", type=int, default=19011)
+    p.add_argument("--web-port", type=int, default=19012,
+                   help="port of the control console (app.py)")
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--bitrate", default="14M",
                    help="x264/nvenc target bitrate, e.g. 14M")
@@ -57,12 +62,17 @@ def parse_args(argv: list[str] | None = None) -> Config:
     p.add_argument("--monitor", type=int, default=None,
                    help="debug: capture this mss monitor index and skip all "
                         "virtual-display management")
+    p.add_argument("--no-browser", dest="browser", action="store_false",
+                   help="do not open the console page automatically")
+    p.add_argument("--keep-display", dest="detach_on_exit", action="store_false",
+                   help="leave the virtual display attached after exit")
     p.add_argument("--list", dest="list_only", action="store_true",
                    help="print display information and exit")
     a = p.parse_args(argv)
     return Config(
         video_port=a.video_port, control_port=a.control_port,
-        fps=a.fps, bitrate=a.bitrate, codec=a.codec, side=a.side,
-        portrait=a.portrait, landscape=a.landscape,
+        web_port=a.web_port, fps=a.fps, bitrate=a.bitrate, codec=a.codec,
+        side=a.side, portrait=a.portrait, landscape=a.landscape,
         ffmpeg=a.ffmpeg, monitor=a.monitor, list_only=a.list_only,
+        browser=a.browser, detach_on_exit=a.detach_on_exit,
     )

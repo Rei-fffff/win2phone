@@ -7,17 +7,23 @@ normal second screen, so windows can be dragged onto it.
 
 Pipeline
     mss grab(VDD) -> composite mouse cursor -> FFmpeg H.264 -> TCP 19010
-    control (JSON lines) on TCP 19011, shared by the phone app and the PC panel
+    control (JSON lines) on TCP 19011, shared by the phone app and the console
+
+This module exposes the :class:`Host` object so ``app.py`` can run it inside a
+single process next to the web console; ``python host.py`` still works standalone.
 
 Design notes that are not obvious from the code:
   * DPI awareness must be enabled before mss is imported, otherwise every
     coordinate (cursor, touch, monitor rects) is silently virtualised.
   * The VDD's \\\\.\\DISPLAYn name changes across device restarts, so it is
     always re-resolved by DeviceString, never by index.
+  * Listening sockets use SO_EXCLUSIVEADDRUSE. On Windows plain SO_REUSEADDR
+    lets a *second* instance bind the same port and silently steal connections,
+    which looks like "the phone connects only sometimes".
   * mss/BitBlt never captures the cursor on an IddCx display, so we draw it.
   * The virtual display stays attached while the host runs (so a phone that
     reconnects does not make Windows re-enumerate displays) and is detached
-    only on exit.
+    when the host stops.
 
 See README.md and protocol.md.
 """
@@ -70,6 +76,10 @@ from config import Config, parse_args   # noqa: E402
 from cursor import CursorCompositor     # noqa: E402
 
 SIDE_LABEL = {"right": "右", "left": "左", "top": "上", "bottom": "下"}
+
+# app.py runs under pythonw (no console); without this every ffmpeg launch
+# would flash a console window on top of whatever the user is doing.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 # ---------------------------------------------------------------- Win32 input
@@ -179,7 +189,7 @@ def pick_codec(cfg: Config) -> str:
         ]
         result = subprocess.run(
             probe, input=b"\x40" * (640 * 360 * 4 * 2),
-            capture_output=True, timeout=20)
+            capture_output=True, timeout=20, creationflags=_NO_WINDOW)
         if result.returncode == 0 and result.stdout:
             return "nvenc"
     except Exception:
@@ -271,7 +281,7 @@ class VirtualDisplay:
 
 # ------------------------------------------------------------ shared state hub
 class ControlHub:
-    """State shared by the phone app, the PC panel and the video session."""
+    """State shared by the phone app, the console page and the video session."""
 
     SIDES = ("right", "left", "top", "bottom")
 
@@ -289,6 +299,9 @@ class ControlHub:
         self.note = "调试模式（--monitor）：不管理虚拟屏" if vd is None else ""
         self.applied = vd is not None
         self.restart = threading.Event()
+        self.video_clients = 0
+        self.last_error = ""
+        self.last_session_end = 0.0
 
     # ---- state changes ----------------------------------------------------
     def refresh(self) -> None:
@@ -395,7 +408,7 @@ def serve_stream(cfg: Config, conn: socket.socket, stop: threading.Event,
 
     Without the ``alive`` flag a disconnected client leaves the capture loop
     writing into an FFmpeg pipe nobody drains; the session then blocks forever
-    and video_server never accepts another connection.
+    and the video server never accepts another connection.
     """
     hub.restart.clear()
     hub.refresh()
@@ -416,6 +429,7 @@ def serve_stream(cfg: Config, conn: socket.socket, stop: threading.Event,
     proc = subprocess.Popen(
         ffmpeg_cmd(cfg, w, h, hub.codec),
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        creationflags=_NO_WINDOW,
     )
     chunks: queue.Queue = queue.Queue()
     alive = threading.Event()
@@ -485,27 +499,32 @@ def serve_stream(cfg: Config, conn: socket.socket, stop: threading.Event,
             print("[ffmpeg]", err.strip()[:500])
 
 
-def video_server(cfg: Config, stop: threading.Event, hub: ControlHub) -> None:
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", cfg.video_port))
-    srv.listen(5)
-    srv.settimeout(1.0)
-    print(f"[video] listening on {cfg.video_port}")
+def video_server(srv: socket.socket, cfg: Config, stop: threading.Event,
+                 hub: ControlHub) -> None:
     while not stop.is_set():
         try:
             conn, addr = srv.accept()
         except socket.timeout:
             continue
+        except OSError:
+            break
         print(f"[video] client connected {addr}")
+        with hub.lock:
+            hub.video_clients += 1
         try:
             serve_stream(cfg, conn, stop, hub)
         except Exception as exc:
+            hub.last_error = f"{type(exc).__name__}: {exc}"
             print(f"[video] session ended: {exc}")
         finally:
-            conn.close()
+            with hub.lock:
+                hub.video_clients = max(0, hub.video_clients - 1)
+            hub.last_session_end = time.time()
+            try:
+                conn.close()
+            except OSError:
+                pass
             print("[video] session closed, waiting for next client")
-    srv.close()
 
 
 # -------------------------------------------------------------- control server
@@ -514,8 +533,7 @@ def handle(msg: dict, hub: ControlHub, conn: socket.socket) -> dict | None:
     if kind == "hello":
         hub.set_role(conn, str(msg.get("client", "")))
         # Exactly one reply per command: the phone app applies `orientation`
-        # from this status, and panel.py relies on the 1:1 request/response
-        # pairing of its short-lived connections.
+        # from this status, and short-lived clients rely on the 1:1 pairing.
         return hub.status("hello")
     if kind == "query":
         return hub.status()
@@ -579,21 +597,161 @@ def control_session(hub: ControlHub, conn: socket.socket, addr,
         print("[control] client disconnected")
 
 
-def control_server(cfg: Config, stop: threading.Event, hub: ControlHub) -> None:
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", cfg.control_port))
-    srv.listen(5)
-    srv.settimeout(1.0)
-    print(f"[control] listening on {cfg.control_port}")
+def control_server(srv: socket.socket, hub: ControlHub,
+                   stop: threading.Event) -> None:
     while not stop.is_set():
         try:
             conn, addr = srv.accept()
         except socket.timeout:
             continue
+        except OSError:
+            break
         threading.Thread(target=control_session, args=(hub, conn, addr, stop),
                          daemon=True).start()
-    srv.close()
+
+
+# ------------------------------------------------------------------------ host
+def _listen(port: int) -> socket.socket:
+    """Bind a listening socket that a second instance cannot steal.
+
+    Windows' SO_REUSEADDR means "allow binding an address already in use", so a
+    stale host plus a fresh one can both listen and connections land on either
+    process at random — which looks exactly like "the phone connects only
+    sometimes". SO_EXCLUSIVEADDRUSE makes the second bind fail loudly instead.
+    """
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        try:
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        except OSError:
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    else:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        srv.bind(("0.0.0.0", port))
+    except OSError as exc:
+        srv.close()
+        raise RuntimeError(
+            f"端口 {port} 无法绑定：{exc}。多半是已经有一个 Win2Phone 主机在运行，"
+            f"先关掉它（或换 --video-port / --control-port）。") from exc
+    srv.listen(5)
+    srv.settimeout(1.0)
+    return srv
+
+
+class Host:
+    """Owns the display, the encoder loop and both TCP servers."""
+
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self.vd: VirtualDisplay | None = None
+        self.hub: ControlHub | None = None
+        self.stop_event = threading.Event()
+        self.threads: list[threading.Thread] = []
+        self.sockets: list[socket.socket] = []
+        self.running = False
+        self.error = ""
+        self._detached = threading.Event()
+
+    # ---- lifecycle -------------------------------------------------------
+    def start(self) -> None:
+        cfg = self.cfg
+        cfg.ffmpeg = resolve_ffmpeg(cfg.ffmpeg)
+        print(f"[init] ffmpeg = {cfg.ffmpeg}")
+
+        # Bind before touching the display: a port conflict must fail fast and
+        # without a screen flicker.
+        video_srv = _listen(cfg.video_port)
+        try:
+            control_srv = _listen(cfg.control_port)
+        except Exception:
+            video_srv.close()
+            raise
+        self.sockets = [video_srv, control_srv]
+        print(f"[video] listening on {cfg.video_port}")
+        print(f"[control] listening on {cfg.control_port}")
+
+        cfg.codec = pick_codec(cfg)
+        print(f"[init] encoder = {cfg.codec}")
+
+        if cfg.monitor is not None:
+            with mss.mss() as sct:
+                if cfg.monitor >= len(sct.monitors):
+                    raise RuntimeError(
+                        f"monitor {cfg.monitor} 不存在，可用 0..{len(sct.monitors)-1}")
+                mon = dict(sct.monitors[cfg.monitor])
+            print(f"[init] 调试模式：抓 mss[{cfg.monitor}] {mon}")
+        else:
+            self.vd = VirtualDisplay(cfg)
+            self.vd.ensure()
+            self.vd.configure("portrait", cfg.side)
+            _, mon = self.vd.monitor()
+
+        self.hub = ControlHub(cfg, self.vd, mon, cfg.codec)
+        self.threads = [
+            threading.Thread(target=video_server,
+                             args=(video_srv, cfg, self.stop_event, self.hub),
+                             daemon=True, name="w2p-video"),
+            threading.Thread(target=control_server,
+                             args=(control_srv, self.hub, self.stop_event),
+                             daemon=True, name="w2p-control"),
+        ]
+        for t in self.threads:
+            t.start()
+        self.running = True
+        print("[init] 就绪，等待手机连接")
+
+    def stop(self, detach: bool = True) -> None:
+        self.running = False
+        self.stop_event.set()
+        for srv in self.sockets:
+            try:
+                srv.close()
+            except OSError:
+                pass
+        self.sockets = []
+        for t in self.threads:
+            t.join(timeout=2)
+        self.threads = []
+        if detach:
+            self.detach()
+        print("[host] stopped")
+
+    def detach(self) -> None:
+        """Remove the virtual display once (safe to call repeatedly)."""
+        if self.vd is None or self._detached.is_set() or not self.cfg.detach_on_exit:
+            return
+        self._detached.set()
+        try:
+            disp.detach()
+            print("[vdd] 虚拟屏已摘除")
+        except Exception as exc:
+            print(f"[vdd] 摘除失败：{exc}")
+
+    # ---- introspection ---------------------------------------------------
+    def info(self) -> dict:
+        out = {
+            "running": self.running,
+            "error": self.error,
+            "video_port": self.cfg.video_port,
+            "control_port": self.cfg.control_port,
+            "fps": self.cfg.fps,
+            "bitrate": self.cfg.bitrate,
+            "codec": self.cfg.codec,
+            "vdd": self.vd.device if self.vd else "",
+            "debug_monitor": self.cfg.monitor,
+        }
+        if self.hub is not None:
+            with self.hub.lock:
+                out["video_clients"] = self.hub.video_clients
+            out["last_session_end"] = self.hub.last_session_end
+            out["last_error"] = self.hub.last_error
+        return out
+
+    def status(self) -> dict:
+        if self.hub is None:
+            return {}
+        return self.hub.status()
 
 
 # ------------------------------------------------------------------------ main
@@ -604,9 +762,8 @@ def _install_close_handler(on_close) -> bool:
     """Run ``on_close`` when the console window is closed.
 
     Closing a console window does not raise KeyboardInterrupt — Windows sends
-    CTRL_CLOSE_EVENT and then kills the process, so a plain ``finally`` never
-    runs and the virtual display would be left behind. Handling the event gives
-    us a few seconds to detach it.
+    CTRL_CLOSE_EVENT and then kills the process, so ``finally`` never runs and
+    the virtual display would be left behind.
     """
     global _CTRL_HANDLER
     try:
@@ -637,64 +794,27 @@ def main() -> int:
                 print(f"  mss[{i}] {m}")
         return 0
 
-    cfg.ffmpeg = resolve_ffmpeg(cfg.ffmpeg)
     print("Win2Phone host — Ctrl+C 退出")
-    print(f"[init] ffmpeg = {cfg.ffmpeg}")
+    h = Host(cfg)
+    try:
+        h.start()
+    except Exception as exc:
+        h.error = str(exc)
+        print(f"[error] {exc}")
+        h.stop()
+        return 2
 
-    vd: VirtualDisplay | None = None
-    if cfg.monitor is not None:
-        with mss.mss() as sct:
-            if cfg.monitor >= len(sct.monitors):
-                print(f"[error] monitor {cfg.monitor} 不存在，可用 0..{len(sct.monitors)-1}")
-                return 2
-            mon = dict(sct.monitors[cfg.monitor])
-        print(f"[init] 调试模式：抓 mss[{cfg.monitor}] {mon}")
-    else:
-        vd = VirtualDisplay(cfg)
-        try:
-            vd.ensure()
-            vd.configure("portrait", cfg.side)
-        except Exception as exc:
-            print(f"[error] {exc}")
-            return 2
-        _, mon = vd.monitor()
-
-    cfg.codec = pick_codec(cfg)
-    print(f"[init] encoder = {cfg.codec}")
-    hub = ControlHub(cfg, vd, mon, cfg.codec)
-
-    stop = threading.Event()
-    threads = [
-        threading.Thread(target=video_server, args=(cfg, stop, hub), daemon=True),
-        threading.Thread(target=control_server, args=(cfg, stop, hub), daemon=True),
-    ]
-    for t in threads:
-        t.start()
+    _install_close_handler(h.detach)
     print(f"[init] 手机端 USB 连接前先执行：\n"
           f"        adb reverse tcp:{cfg.video_port} tcp:{cfg.video_port}\n"
           f"        adb reverse tcp:{cfg.control_port} tcp:{cfg.control_port}")
-
-    detached = threading.Event()
-
-    def detach_once() -> None:
-        if vd is None or detached.is_set():
-            return
-        detached.set()
-        try:
-            disp.detach()
-            print("[vdd] 虚拟屏已摘除")
-        except Exception as exc:
-            print(f"[vdd] 摘除失败：{exc}")
-
-    _install_close_handler(detach_once)
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n[main] 停止中…")
-        stop.set()
     finally:
-        detach_once()
+        h.stop()
     return 0
 
 
