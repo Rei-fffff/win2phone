@@ -72,7 +72,7 @@ import mss                       # noqa: E402
 import win32api                  # noqa: E402
 
 import display as disp           # noqa: E402
-from config import Config, parse_args   # noqa: E402
+from config import SCALES, Config, parse_args   # noqa: E402
 from cursor import CursorCompositor     # noqa: E402
 
 SIDE_LABEL = {"right": "右", "left": "左", "top": "上", "bottom": "下"}
@@ -223,7 +223,14 @@ class VirtualDisplay:
         self.device = ""
 
     def size_for(self, orientation: str) -> tuple[int, int]:
-        return self.cfg.landscape if orientation == "landscape" else self.cfg.portrait
+        """Display size for the current orientation × pixel scale.
+
+        The scale only divides the pixel count (1/1, 3/4, 2/3, 1/2); the 9:20
+        aspect ratio is preserved exactly, so the phone never has to stretch.
+        """
+        base = self.cfg.landscape if orientation == "landscape" else self.cfg.portrait
+        num, den = SCALES.get(self.cfg.scale, (1, 1))
+        return base[0] * num // den, base[1] * num // den
 
     def ensure(self) -> str:
         v = disp.find_virtual()
@@ -250,9 +257,22 @@ class VirtualDisplay:
 
     def configure(self, orientation: str, side: str) -> tuple[int, int, int, int]:
         w, h = self.size_for(orientation)
-        geo = disp.place(self.device, side, w, h)
-        print(f"[vdd] orientation={orientation} {geo[0]}x{geo[1]} "
-              f"@ ({geo[2]},{geo[3]}) side={side}")
+        try:
+            geo = disp.place(self.device, side, w, h)
+        except ValueError:
+            # The requested scale is not in the driver's mode list (usually the
+            # system copy of vdd_settings.xml is stale). Fall back to the
+            # nearest mode with the same aspect ratio rather than stretching.
+            modes = disp.modes(self.device)
+            same = [m for m in modes
+                    if abs(m[0] / m[1] - w / h) < 0.002] or modes
+            if not same:
+                raise
+            pick = min(same, key=lambda m: abs(m[0] - w) + abs(m[1] - h))
+            print(f"[vdd] {w}x{h} 不在驱动模式列表里，改用 {pick[0]}x{pick[1]}")
+            geo = disp.place(self.device, side, pick[0], pick[1])
+        print(f"[vdd] orientation={orientation} scale={self.cfg.scale} "
+              f"{geo[0]}x{geo[1]} @ ({geo[2]},{geo[3]}) side={side}")
         return geo
 
     def monitor(self, timeout: float = 3.0) -> tuple[int, dict]:
@@ -352,6 +372,27 @@ class ControlHub:
         print(f"[control] orientation -> {value}; video session restarts")
         return self.note
 
+    def set_scale(self, value: str) -> str:
+        """Change the pixel scale (100/75/67/50). Aspect ratio is untouched."""
+        if value not in SCALES:
+            return f"unknown scale: {value}"
+        self.cfg.scale = value
+        if self.vd is None:
+            self.restart.set()
+            return "调试模式：分辨率未管理"
+        try:
+            geo = self.vd.configure(self.orientation, self.side)
+            self.applied = True
+            self.note = f"虚拟屏 {geo[0]}x{geo[1]}（{value}%）"
+        except Exception as exc:
+            self.applied = False
+            self.note = f"分辨率切换失败：{exc}"
+            print(f"[control] scale -> {value} failed: {exc}")
+        self.refresh()
+        self.restart.set()
+        print(f"[control] scale -> {value}; video session restarts")
+        return self.note
+
     # ---- status -----------------------------------------------------------
     def status(self, msg_type: str = "status") -> dict:
         return {
@@ -366,6 +407,7 @@ class ControlHub:
             "top": self.mon["top"],
             "fps": self.cfg.fps,
             "bitrate": self.cfg.bitrate,
+            "scale": self.cfg.scale,
             "codec": self.codec,
             "display_applied": self.applied,
             "note": self.note,
@@ -558,6 +600,14 @@ def handle(msg: dict, hub: ControlHub, conn: socket.socket) -> dict | None:
             return {"type": "error", "message": f"unknown orientation: {value}"}
         hub.set_orientation(value)
         hub.broadcast({"type": "orientation", "value": value}, exclude=conn)
+        st = hub.status()
+        hub.broadcast(st, exclude=conn)
+        return st
+    if kind == "scale":
+        value = str(msg.get("value", ""))
+        if value not in SCALES:
+            return {"type": "error", "message": f"unknown scale: {value}"}
+        hub.set_scale(value)
         st = hub.status()
         hub.broadcast(st, exclude=conn)
         return st

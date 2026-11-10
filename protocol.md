@@ -37,7 +37,8 @@ UTF-8，**一行一个 JSON 对象**（`\n` 分隔）。
 | `query` | — | 主动拉取当前状态（面板刷新用） |
 | `touch` | `action`(`down`/`move`/`up`), `x`, `y` | `x`/`y` 为 0..1 归一化坐标 |
 | `side` | `value`(`right`/`left`/`top`/`bottom`) | 改虚拟屏相对主屏位置，决定鼠标从哪边穿过去 |
-| `orientation` | `value`(`portrait`/`landscape`) | 切方向：改 `--scale` 尺寸 + 重启视频会话 |
+| `orientation` | `value`(`portrait`/`landscape`) | 切方向：按新方向重设虚拟屏分辨率 + 重启视频会话 |
+| `scale` | `value`(`100`/`75`/`67`/`50`) | 像素档位，长宽比恒为 9:20，只变像素数；同样重启会话 |
 | `mode` | `value`(`wifi`/`usb`) | 仅记录，地址由手机端决定 |
 
 示例：
@@ -62,8 +63,9 @@ UTF-8，**一行一个 JSON 对象**（`\n` 分隔）。
 |---|---|
 | `side` | `right`/`left`/`top`/`bottom`，虚拟屏相对主屏的位置，决定鼠标从哪条边穿过去 |
 | `orientation` | `landscape`/`portrait`；手机端据此旋转 Activity，必须与虚拟屏形状一致 |
-| `width`, `height` | 虚拟屏（= 编码）分辨率，M1 起等于手机原生比例 |
+| `width`, `height` | 虚拟屏（= 编码）分辨率，等于手机原生比例 × 当前档位 |
 | `source_width`, `source_height` | 采集源分辨率，与上面相同（不再缩放） |
+| `scale` | 当前像素档位 `100`/`75`/`67`/`50` |
 | `left`, `top` | 虚拟屏在 Windows 虚拟桌面里的原点；触控映射用这个 |
 | `fps`, `bitrate`, `codec` | 帧率、目标码率、实际编码器（`nvenc`/`x264`） |
 | `display_applied` | Windows 显示器设置是否真的生效；`false` 一般是 VDD 未安装或未接入桌面 |

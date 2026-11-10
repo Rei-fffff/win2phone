@@ -1,9 +1,22 @@
 <?xml version='1.0' encoding='utf-8'?>
 <!--
-  Win2Phone 专用 VDD 配置
-  分辨率全部按手机屏幕原生 9:20 比例（1080x2400）给出，手机端 1:1 铺满，
-  不变形、不 letterbox，触控坐标天然准确。
-  改完这个文件后需要重启虚拟显示器（禁用/启用设备）才会重新读取。
+  Win2Phone 专用 VDD 配置。
+
+  所有模式都是手机屏幕的原生比例 9:20（1080:2400）的整数约分：
+      1080x2400      = 9:20     竖屏 100%
+       810x1800      = 9:20      竖屏 75%
+       720x1600      = 9:20      竖屏 67%
+       540x1200      = 9:20      竖屏 50%
+      2400x1080      = 20:9     横屏 100%
+      1800x810       = 20:9     横屏 75%
+      1600x720       = 20:9     横屏 67%
+      1200x540       = 20:9     横屏 50%
+
+  比例严格一致，所以手机端任何一档都是 1:1 铺满，不会有黑边也不会拉伸。
+  降低分辨率 = 同样的桌面用更少的像素排 = 字变大（虚拟屏 DPI 固定 100%）。
+
+  改完这个文件后必须重启虚拟显示器设备才会重新读取：
+      管理员: devcon restart Root\MttVDD
 -->
 <vdd_settings>
     <monitors>
@@ -16,28 +29,52 @@
         <g_refresh_rate>60</g_refresh_rate>
     </global>
     <resolutions>
-        <!-- 竖屏：手机原生 -->
+        <!-- 竖屏 100% -->
         <resolution>
             <width>1080</width>
             <height>2400</height>
             <refresh_rate>60</refresh_rate>
         </resolution>
-        <!-- 横屏：手机旋转 90 度 -->
-        <resolution>
-            <width>2400</width>
-            <height>1080</height>
-            <refresh_rate>60</refresh_rate>
-        </resolution>
-        <!-- 竖屏降采样（带宽/解码吃紧时用） -->
+        <!-- 竖屏 75% -->
         <resolution>
             <width>810</width>
             <height>1800</height>
             <refresh_rate>60</refresh_rate>
         </resolution>
-        <!-- 横屏降采样 -->
+        <!-- 竖屏 67% -->
+        <resolution>
+            <width>720</width>
+            <height>1600</height>
+            <refresh_rate>60</refresh_rate>
+        </resolution>
+        <!-- 竖屏 50% -->
+        <resolution>
+            <width>540</width>
+            <height>1200</height>
+            <refresh_rate>60</refresh_rate>
+        </resolution>
+        <!-- 横屏 100% -->
+        <resolution>
+            <width>2400</width>
+            <height>1080</height>
+            <refresh_rate>60</refresh_rate>
+        </resolution>
+        <!-- 横屏 75% -->
         <resolution>
             <width>1800</width>
             <height>810</height>
+            <refresh_rate>60</refresh_rate>
+        </resolution>
+        <!-- 横屏 67% -->
+        <resolution>
+            <width>1600</width>
+            <height>720</height>
+            <refresh_rate>60</refresh_rate>
+        </resolution>
+        <!-- 横屏 50% -->
+        <resolution>
+            <width>1200</width>
+            <height>540</height>
             <refresh_rate>60</refresh_rate>
         </resolution>
     </resolutions>
@@ -45,8 +82,7 @@
         <CustomEdid>false</CustomEdid>
         <PreventSpoof>false</PreventSpoof>
         <EdidCeaOverride>false</EdidCeaOverride>
-        <!-- 硬件光标开关：false 时实测 mss 抓不到光标（虚拟屏上光标不绘制），
-             先试 true 看驱动是否会把它合成进帧缓冲 -->
+        <!-- 硬件光标：实测开/关 mss 都抓不到 VDD 上的光标，光标由 cursor.py 自己合成 -->
         <HardwareCursor>true</HardwareCursor>
         <SDR10bit>false</SDR10bit>
         <HDRPlus>false</HDRPlus>

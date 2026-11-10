@@ -20,6 +20,20 @@ def parse_size(text: str) -> tuple[int, int]:
     return w, h
 
 
+# 分辨率档位。只缩放像素数量，长宽比永远保持手机原生的 9:20，
+# 所以手机端任何一档都是 1:1 铺满，不会出现拉伸或黑边。
+# 1080x2400 / 2400x1080 能被这三个分数整除，结果全是整数像素。
+# 分辨率越低 → 同样的桌面用更少的像素排 → 字越大（虚拟屏 DPI 恒为 100%）。
+SCALES: dict[str, tuple[int, int]] = {
+    "100": (1, 1),
+    "75": (3, 4),
+    "67": (2, 3),
+    "50": (1, 2),
+}
+SCALE_CHOICES = tuple(SCALES)
+SCALE_LABEL = {"100": "100%", "75": "75%", "67": "67%", "50": "50%"}
+
+
 @dataclass
 class Config:
     video_port: int = 19010
@@ -29,6 +43,7 @@ class Config:
     bitrate: str = "14M"
     codec: str = "auto"            # auto | nvenc | x264
     side: str = "right"            # right | left | top | bottom
+    scale: str = "67"              # 100 | 75 | 67 | 50（像素档位，比例不变）
     portrait: tuple[int, int] = (1080, 2400)
     landscape: tuple[int, int] = (2400, 1080)
     ffmpeg: str = ""               # empty -> resolve from imageio-ffmpeg
@@ -52,6 +67,9 @@ def parse_args(argv: list[str] | None = None) -> Config:
     p.add_argument("--side", choices=["right", "left", "top", "bottom"],
                    default="right",
                    help="where the virtual display sits relative to the primary one")
+    p.add_argument("--scale", choices=SCALE_CHOICES, default="67",
+                   help="pixel scale of the virtual display; the 9:20 aspect ratio "
+                        "never changes, so nothing is stretched. Lower = bigger text")
     p.add_argument("--portrait", type=parse_size, default=(1080, 2400),
                    help="virtual display mode when the phone is upright")
     p.add_argument("--landscape", type=parse_size, default=(2400, 1080),
@@ -72,7 +90,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
     return Config(
         video_port=a.video_port, control_port=a.control_port,
         web_port=a.web_port, fps=a.fps, bitrate=a.bitrate, codec=a.codec,
-        side=a.side, portrait=a.portrait, landscape=a.landscape,
+        side=a.side, scale=a.scale, portrait=a.portrait, landscape=a.landscape,
         ffmpeg=a.ffmpeg, monitor=a.monitor, list_only=a.list_only,
         browser=a.browser, detach_on_exit=a.detach_on_exit,
     )

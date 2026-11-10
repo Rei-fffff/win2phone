@@ -102,7 +102,7 @@ sys.stderr = Tee(sys.stderr, LOG)
 # host import must come after the tee is installed so its startup lines are
 # captured; host also enables DPI awareness before importing mss.
 import host as host_mod                     # noqa: E402
-from config import parse_args               # noqa: E402
+from config import SCALES, parse_args       # noqa: E402
 
 
 # ---------------------------------------------------------------------- adb
@@ -363,6 +363,10 @@ h2{font-size:13px;margin:0 0 10px;color:#546e7a;font-weight:600}
 .row{display:flex;gap:10px}
 .row button{flex:1;padding:11px}
 .row button.on{background:#1976d2;border-color:#1976d2;color:#fff}
+#scale-row button{padding:9px 6px;line-height:1.3}
+#scale-row .pct{display:block;font-size:15px}
+#scale-row small{display:block;color:#90a4ae;font-size:11px;margin-top:2px}
+#scale-row button.on small{color:#cfe3f7}
 .alert{background:#fdecea;border:1px solid #f5c6c2;color:#b3261e;border-radius:10px;
        padding:11px 14px;margin-bottom:12px;font-size:13px;white-space:pre-wrap}
 .hidden{display:none}
@@ -414,8 +418,20 @@ pre#log{background:#0f1720;color:#c9d6e2;border-radius:8px;padding:10px;height:2
   <div class="hint">切换会改虚拟屏分辨率，手机会自动旋转并重连，约 1 秒中断。</div>
 </details>
 
+<details class="card" open id="sec-scale">
+  <summary>③ 分辨率 / 字号 <span class="tag" id="scale-tag"></span></summary>
+  <div class="row" id="scale-row">
+    <button data-scale="100"><span class="pct">100%</span><small></small></button>
+    <button data-scale="75"><span class="pct">75%</span><small></small></button>
+    <button data-scale="67"><span class="pct">67%</span><small></small></button>
+    <button data-scale="50"><span class="pct">50%</span><small></small></button>
+  </div>
+  <div class="hint">档位越低，桌面元素相对越大、字越好读。长宽比固定 9:20（横屏 20:9），
+    手机端始终 1:1 铺满，<b>任何一档都不会拉伸</b>。切换约 1 秒中断。</div>
+</details>
+
 <details class="card" id="sec-adb">
-  <summary>③ USB 连接 <span class="tag" id="adb-tag"></span></summary>
+  <summary>④ USB 连接 <span class="tag" id="adb-tag"></span></summary>
   <div class="kv">
     <div class="k">adb</div><div class="v" id="v-adbpath">—</div>
     <div class="k">设备</div><div class="v" id="v-adbdev">—</div>
@@ -429,12 +445,27 @@ pre#log{background:#0f1720;color:#c9d6e2;border-radius:8px;padding:10px;height:2
 </details>
 
 <details class="card" id="sec-log">
-  <summary>④ 日志 <span class="tag">点击展开</span></summary>
+  <summary>⑤ 日志 <span class="tag">点击展开</span></summary>
   <pre id="log"></pre>
 </details>
 
 <script>
 let logSeq = 0, lastStatus = null;
+
+// 与 config.py 的 SCALES 保持一致：只缩像素数，比例恒为 9:20
+const BASE_SIZE = { portrait: [1080, 2400], landscape: [2400, 1080] };
+const SCALE_RATIO = { '100': [1, 1], '75': [3, 4], '67': [2, 3], '50': [1, 2] };
+
+function refreshScaleLabels(orient){
+  const b = BASE_SIZE[orient] || BASE_SIZE.portrait;
+  document.querySelectorAll('[data-scale]').forEach(function(btn){
+    const r = SCALE_RATIO[btn.dataset.scale] || [1, 1];
+    const w = Math.floor(b[0] * r[0] / r[1]);
+    const h = Math.floor(b[1] * r[0] / r[1]);
+    const small = btn.querySelector('small');
+    if (small) small.textContent = w + '×' + h;
+  });
+}
 
 function el(id){ return document.getElementById(id); }
 function setPill(cls, text){ el('pill').className = 'pill ' + cls; el('pill').textContent = text; }
@@ -472,6 +503,11 @@ function paint(s){
   document.querySelectorAll('[data-orientation]').forEach(function(b){
     b.classList.toggle('on', b.dataset.orientation === d.orientation);
   });
+  document.querySelectorAll('[data-scale]').forEach(function(b){
+    b.classList.toggle('on', b.dataset.scale === (d.scale || '100'));
+  });
+  el('scale-tag').textContent = d.scale ? ('当前 ' + d.scale + '%') : '';
+  refreshScaleLabels(d.orientation);
 
   el('v-adbpath').textContent = s.adbpath || '（见日志）';
   el('v-adbdev').textContent = (adb.devices && adb.devices.length)
@@ -520,6 +556,16 @@ document.querySelectorAll('[data-orientation]').forEach(function(b){
   b.onclick = async function(){
     try { await jget('/api/cmd?type=orientation&value=' + b.dataset.orientation); } catch (e) {}
     setTimeout(tick, 1500);
+  };
+});
+
+document.querySelectorAll('[data-scale]').forEach(function(b){
+  b.onclick = async function(){
+    const row = el('scale-row');
+    row.querySelectorAll('button').forEach(function(x){ x.disabled = true; });
+    try { await jget('/api/cmd?type=scale&value=' + b.dataset.scale); } catch (e) {}
+    row.querySelectorAll('button').forEach(function(x){ x.disabled = false; });
+    setTimeout(tick, 1800);
   };
 });
 
@@ -611,6 +657,8 @@ class Handler(BaseHTTPRequestHandler):
                     note = h.hub.set_side(value)
                 elif kind == "orientation" and value in ("portrait", "landscape"):
                     note = h.hub.set_orientation(value)
+                elif kind == "scale" and value in SCALES:
+                    note = h.hub.set_scale(value)
                 else:
                     self._json({"ok": False, "error": "参数无效"})
                     return
